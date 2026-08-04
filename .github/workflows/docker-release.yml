@@ -2,6 +2,12 @@ name: Build and Release Docker Container
 
 on:
     workflow_dispatch:
+    release:
+        types: [published]
+
+permissions:
+    contents: read
+    packages: write
 
 jobs:
     build-and-release:
@@ -16,7 +22,7 @@ jobs:
               with:
                   registry: ghcr.io
                   username: 'wu21-web'
-                  password: ${{ secrets.DOCKER_TOKEN }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
             
             - name: Print additional debug info
               run: |
@@ -33,4 +39,4 @@ jobs:
               with:
                   context: .
                   push: true
-                  tags: ghcr.io/wu21-web/mereader:2.3
+                  tags: ghcr.io/wu21-web/mereader:2.5
