@@ -1,6 +1,6 @@
 export function deriveExportTitle(title?: string): string {
   if (!title) {
-    return "MeReader Export";
+    return "FancyMDPrinter Export";
   }
 
   const lastSlash = Math.max(title.lastIndexOf("/"), title.lastIndexOf("\\"));

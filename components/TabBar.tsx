@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import UrlImportForm from "@/components/UrlImportForm";
 
 interface Tab {
   id: string;
@@ -16,6 +17,7 @@ interface TabBarProps {
   onToggleBatchSidebar: () => void;
   onAddFolder: () => void;
   onAddFile: () => void;
+  onImportUrl: (url: string) => Promise<void>;
 }
 
 export default function TabBar({
@@ -27,8 +29,10 @@ export default function TabBar({
   onToggleBatchSidebar,
   onAddFolder,
   onAddFile,
+  onImportUrl,
 }: TabBarProps) {
   const [showAddMenu, setShowAddMenu] = useState(false);
+  const [showUrlInput, setShowUrlInput] = useState(false);
 
   return (
     <div className="flex items-end border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 min-h-[42px]">
@@ -120,7 +124,7 @@ export default function TabBar({
         </button>
 
         {showAddMenu && (
-          <div className="absolute right-0 top-11 z-20 w-44 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 shadow-lg p-1">
+          <div className="absolute right-0 top-11 z-20 w-72 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 shadow-lg p-1">
             <button
               type="button"
               onClick={() => {
@@ -141,6 +145,26 @@ export default function TabBar({
             >
               Open .md File
             </button>
+            <button
+              type="button"
+              onClick={() => setShowUrlInput((prev) => !prev)}
+              className="w-full text-left px-3 py-2 text-sm rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-800 dark:text-gray-100"
+            >
+              Import from URL…
+            </button>
+            {showUrlInput && (
+              <div className="mt-1 border-t border-gray-200 dark:border-gray-700 pt-2">
+                <UrlImportForm
+                  compact
+                  autoFocus
+                  onImport={async (url) => {
+                    await onImportUrl(url);
+                    setShowAddMenu(false);
+                    setShowUrlInput(false);
+                  }}
+                />
+              </div>
+            )}
           </div>
         )}
         </div>

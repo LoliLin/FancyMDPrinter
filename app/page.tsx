@@ -2,9 +2,13 @@
 
 import Link from "next/link";
 import { useState, useCallback, useRef, useEffect } from "react";
+import { toPng } from "html-to-image";
+import JSZip from "jszip";
 import UploadZone from "@/components/UploadZone";
+import UrlImportForm from "@/components/UrlImportForm";
 import TabBar from "@/components/TabBar";
 import MarkdownPreview from "@/components/MarkdownPreview";
+import { deriveExportTitle } from "@/lib/exportTitle";
 
 interface MarkdownTab {
   id: string;
@@ -13,6 +17,10 @@ interface MarkdownTab {
 }
 
 const EXIT_CONFIRM_MESSAGE = "Exit? You will lose all unsaved changes.";
+
+// A4 at 96 CSS px per inch — matches the previous server-side export layout.
+const A4_WIDTH_PX = 794;
+const A4_HEIGHT_PX = 1123;
 
 function makeUniqueName(baseName: string, existingNames: Set<string>): string {
   if (!existingNames.has(baseName)) {
@@ -31,6 +39,26 @@ function makeUniqueName(baseName: string, existingNames: Set<string>): string {
     if (!existingNames.has(candidate)) {
       return candidate;
     }
+  }
+}
+
+// Turn a markdown URL into a tab name: last path segment, ".md" appended when
+// missing, or the hostname when the path has no file name.
+function deriveNameFromUrl(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    const last = decodeURIComponent(url.pathname)
+      .split("/")
+      .filter(Boolean)
+      .pop();
+    if (last) {
+      return /\.md$/i.test(last) ? last : `${last}.md`;
+    }
+    return `${url.hostname.replace(/^www\./, "")}.md`;
+  } catch {
+    const last = rawUrl.split(/[?#]/)[0].split("/").pop() ?? "";
+    if (!last) return "imported.md";
+    return /\.md$/i.test(last) ? last : `${last}.md`;
   }
 }
 
@@ -221,6 +249,39 @@ export default function Home() {
     }
   }, [handleFilesLoaded]);
 
+  const handleImportFromUrl = useCallback(
+    async (url: string) => {
+      const trimmed = url.trim();
+      if (!trimmed) return;
+
+      let res: Response;
+      try {
+        res = await fetch(trimmed, { cache: "no-store" });
+      } catch {
+        throw new Error(
+          "Could not reach the URL (network error or blocked by CORS). " +
+            "raw.githubusercontent.com and most raw/gist hosts work."
+        );
+      }
+
+      if (!res.ok) {
+        throw new Error(`Failed to fetch URL: HTTP ${res.status}`);
+      }
+
+      const contentType = res.headers.get("content-type") ?? "";
+      if (contentType.includes("text/html")) {
+        throw new Error(
+          "URL returned HTML, not a markdown file — use a raw file URL " +
+            "(e.g. raw.githubusercontent.com/…)."
+        );
+      }
+
+      const content = await res.text();
+      handleFilesLoaded([{ name: deriveNameFromUrl(trimmed), content }]);
+    },
+    [handleFilesLoaded]
+  );
+
   const closeTab = useCallback(
     (id: string) => {
       setTabs((prev) => {
@@ -311,59 +372,44 @@ export default function Home() {
       throw new Error("Unable to export: markdown preview not found");
     }
 
-    const html = markdownNode.innerHTML;
-    const res = await fetch("/api/export-pdf", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        html,
-        filePath: tab.name,
-        title: tab.name,
-      }),
-    });
+    // Static (GitHub Pages) export: the PDF is produced by the browser's own
+    // print engine — the same engine the old server-side puppeteer used. The
+    // "printing" body class plus @media print CSS hides the app chrome and
+    // shows only the rendered markdown; the document title becomes the
+    // suggested filename in the "Save as PDF" dialog.
+    const originalTitle = document.title;
+    const wasDark = document.documentElement.classList.contains("dark");
 
-    if (!res.ok) {
-      const contentType = res.headers.get("content-type") || "";
-      let message = "PDF export failed";
+    document.title = deriveExportTitle(tab.name) || "FancyMDPrinter";
+    if (wasDark) document.documentElement.classList.remove("dark");
+    document.body.classList.add("printing");
 
-      const text = await res.text();
-      const looksJson =
-        contentType.includes("application/json") || text.trim().startsWith("{");
+    let fallback = 0;
+    const restore = () => {
+      window.clearTimeout(fallback);
+      document.body.classList.remove("printing");
+      if (wasDark) document.documentElement.classList.add("dark");
+      document.title = originalTitle;
+      window.removeEventListener("afterprint", restore);
+    };
+    window.addEventListener("afterprint", restore);
+    fallback = window.setTimeout(restore, 120_000);
 
-      if (looksJson) {
-        try {
-          const data = JSON.parse(text) as { error?: string };
-          message = data.error ?? message;
-        } catch {
-          message = text.trim().startsWith("<")
-            ? "PDF export failed on server"
-            : text.slice(0, 240) || message;
-        }
-      } else {
-        message = text.trim().startsWith("<")
-          ? "PDF export failed on server"
-          : text.slice(0, 240) || message;
-      }
-
-      throw new Error(message);
+    try {
+      await document.fonts.ready;
+      // Let fonts/layout settle before the print dialog snapshots the page.
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setTimeout(resolve, 100);
+      await promise;
+      window.print();
+      // Browsers that block until the print dialog closes fire afterprint
+      // after print() returns; restore here too so non-blocking/no-op print
+      // implementations (e.g. headless) don't leave the page hidden.
+      restore();
+    } catch (err) {
+      restore();
+      throw new Error(`PDF export failed: ${String(err)}`);
     }
-
-    const okContentType = res.headers.get("content-type") || "";
-    if (!okContentType.includes("application/pdf")) {
-      const text = await res.text();
-      const message = text.trim().startsWith("<")
-        ? "PDF export failed on server"
-        : text.slice(0, 240) || "PDF export failed";
-      throw new Error(message);
-    }
-
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${tab.name.replace(/[/\\]/g, "_")}.pdf`;
-    a.click();
-    URL.revokeObjectURL(url);
   }, []);
 
   const handleExportPdf = async () => {
@@ -379,67 +425,80 @@ export default function Home() {
     }
   };
 
-  const exportTabToPngPages = useCallback(async (tab: MarkdownTab) => {
-    const markdownNode = previewRef.current?.querySelector(".markdown-body");
-    if (!(markdownNode instanceof HTMLElement)) {
-      throw new Error("Unable to export: markdown preview not found");
-    }
-
-    const html = markdownNode.innerHTML;
-    const res = await fetch("/api/export-png-pages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        html,
-        filePath: tab.name,
-        title: tab.name,
-      }),
-    });
-
-    if (!res.ok) {
-      const contentType = res.headers.get("content-type") || "";
-      let message = "PNG export failed";
-
-      const text = await res.text();
-      const looksJson =
-        contentType.includes("application/json") || text.trim().startsWith("{");
-
-      if (looksJson) {
-        try {
-          const data = JSON.parse(text) as { error?: string };
-          message = data.error ?? message;
-        } catch {
-          message = text.trim().startsWith("<")
-            ? "PNG export failed on server"
-            : text.slice(0, 240) || message;
-        }
-      } else {
-        message = text.trim().startsWith("<")
-          ? "PNG export failed on server"
-          : text.slice(0, 240) || message;
+  const exportTabToPngPages = useCallback(
+    async (tab: MarkdownTab) => {
+      const markdownNode = previewRef.current?.querySelector(".markdown-body");
+      if (!(markdownNode instanceof HTMLElement)) {
+        throw new Error("Unable to export: markdown preview not found");
       }
 
-      throw new Error(message);
-    }
+      // Client-side page-sliced PNG export: clone the rendered markdown into
+      // an off-screen A4 viewport (so global styles still apply), rasterise
+      // one PNG per A4 page with html-to-image, and pack them into a ZIP.
+      const base =
+        tab.name.replace(/^.*[\\/]/, "").replace(/\.md$/i, "") || "export";
+      const zip = new JSZip();
 
-    const okContentType = res.headers.get("content-type") || "";
-    if (!okContentType.includes("application/zip")) {
-      const text = await res.text();
-      const message = text.trim().startsWith("<")
-        ? "PNG export failed on server"
-        : text.slice(0, 240) || "PNG export failed";
-      throw new Error(message);
-    }
+      const content = markdownNode.cloneNode(true) as HTMLElement;
+      const host = document.createElement("div");
+      host.style.cssText =
+        `position:fixed;top:0;left:-10000px;width:${A4_WIDTH_PX}px;` +
+        `height:${A4_HEIGHT_PX}px;overflow:hidden;z-index:-1;`;
+      const sheet = document.createElement("div");
+      sheet.style.cssText = `width:${A4_WIDTH_PX}px;`;
+      sheet.appendChild(content);
+      host.appendChild(sheet);
+      document.body.appendChild(host);
 
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const base = tab.name.replace(/^.*[\\/]/, "").replace(/\.md$/i, "") || "export";
-    a.download = `${base}_png_pages.zip`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }, []);
+      try {
+        // Wait for images and fonts so scrollHeight and capture are accurate.
+        await Promise.all(
+          Array.from(content.querySelectorAll("img")).map((img) =>
+            img.decode().catch(() => {})
+          )
+        );
+        await document.fonts.ready;
+
+        sheet.style.height = `${content.scrollHeight}px`;
+        const pageCount = Math.max(
+          1,
+          Math.ceil(content.scrollHeight / A4_HEIGHT_PX)
+        );
+
+        for (let page = 0; page < pageCount; page++) {
+          sheet.style.transform = `translateY(${-page * A4_HEIGHT_PX}px)`;
+          let dataUrl: string;
+          try {
+            dataUrl = await toPng(host, {
+              width: A4_WIDTH_PX,
+              height: A4_HEIGHT_PX,
+              pixelRatio: 2,
+              cacheBust: true,
+              backgroundColor: isDark ? "#0d1117" : "#ffffff",
+            });
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            throw new Error(
+              `PNG export failed (${reason}). Cross-origin images can block canvas capture; remove them from the markdown to export.`
+            );
+          }
+          const blob = await (await fetch(dataUrl)).blob();
+          zip.file(`${base}_page_${page + 1}.png`, blob);
+        }
+
+        const zipBlob = await zip.generateAsync({ type: "blob" });
+        const url = URL.createObjectURL(zipBlob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${base}_png_pages.zip`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } finally {
+        host.remove();
+      }
+    },
+    [isDark]
+  );
 
   const handleExportPngPages = async () => {
     if (!activeTab || !previewRef.current) return;
@@ -588,15 +647,55 @@ export default function Home() {
           className="flex items-center gap-2 rounded focus:outline-none focus:ring-2 focus:ring-blue-400 focus:ring-offset-2 focus:ring-offset-gray-800"
         >
           <svg
-            className="w-6 h-6 text-white"
+            className="w-6 h-6"
             viewBox="0 0 24 24"
-            fill="currentColor"
+            aria-hidden="true"
           >
-            <path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z" />
+            <defs>
+              <linearGradient
+                id="fmd-brand"
+                x1="0"
+                y1="0"
+                x2="24"
+                y2="24"
+                gradientUnits="userSpaceOnUse"
+              >
+                <stop offset="0" stopColor="#4f8cff" />
+                <stop offset="1" stopColor="#7c5cff" />
+              </linearGradient>
+            </defs>
+            <rect
+              x="1"
+              y="1"
+              width="22"
+              height="22"
+              rx="6.5"
+              fill="url(#fmd-brand)"
+            />
+            <path
+              d="M8 5.5h6l3 3V17a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V6.5a1 1 0 0 1 1-1z"
+              fill="#fff"
+            />
+            <path
+              d="M14 5.5v3h3"
+              fill="none"
+              stroke="#4f8cff"
+              strokeWidth="1.3"
+            />
+            <path
+              d="M12 12.6v4.4m0 0l-1.7-1.7m1.7 1.7l1.7-1.7"
+              fill="none"
+              stroke="#4f8cff"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
           </svg>
-          <span className="text-white font-semibold text-lg">MeReader</span>
+          <span className="text-white font-semibold text-lg">
+            FancyMDPrinter
+          </span>
           <span className="text-gray-400 text-sm hidden sm:inline">
-            GFM Live Previewer &amp; PDF Exporter
+            GFM Live Previewer &amp; PDF/PNG Exporter
           </span>
         </Link>
 
@@ -711,7 +810,7 @@ export default function Home() {
         <main className="flex-1 flex flex-col items-center justify-center p-8">
           <div className="w-full max-w-xl">
             <h1 className="text-3xl font-bold text-gray-900 dark:text-white mb-2 text-center">
-              MeReader
+              FancyMDPrinter
             </h1>
             <p className="text-gray-500 dark:text-gray-400 text-center mb-8">
               Upload a folder of{" "}
@@ -725,9 +824,17 @@ export default function Home() {
               file to preview with GitHub-style rendering.
             </p>
             <UploadZone onFilesLoaded={handleFilesLoaded} />
+            <div className="mt-6 flex items-center gap-3 text-xs text-gray-400">
+              <span className="h-px flex-1 bg-gray-200 dark:bg-gray-700" />
+              or import from URL
+              <span className="h-px flex-1 bg-gray-200 dark:bg-gray-700" />
+            </div>
+            <div className="mt-3">
+              <UrlImportForm onImport={handleImportFromUrl} />
+            </div>
             <p className="text-xs text-gray-400 text-center mt-4">
-              Files are read locally in your browser. Server upload is only
-              used when exporting to PDF.
+              Everything runs locally in your browser — files never leave your
+              device. PDF and PNG export need no server.
             </p>
           </div>
         </main>
@@ -857,6 +964,7 @@ export default function Home() {
               onToggleBatchSidebar={() => setBatchSidebarOpen((prev) => !prev)}
               onAddFolder={() => addFolderInputRef.current?.click()}
               onAddFile={() => addFileInputRef.current?.click()}
+              onImportUrl={handleImportFromUrl}
             />
             <div className="flex-1 overflow-y-auto">
               <div
